@@ -80,6 +80,7 @@ def run_epoch(model, loader, optimizer, loss_fn, device,
             batch = batch.to(device)
             # batch.n_id: node IDs trong graph gốc
             n_ids = batch.n_id  # [num_nodes_in_subgraph,]
+            n_ids = n_ids.cpu()
             batch_size = batch.batch_size  # số center nodes
 
             # Categorical features cho subgraph nodes
