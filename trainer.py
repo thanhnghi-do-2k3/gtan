@@ -12,6 +12,18 @@ from torch_geometric.data import Data
 
 from gtan_model import GraphAttnModel
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=0.25):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, logits, targets):
+        ce = nn.functional.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-ce)
+        return ((self.alpha * (1 - pt) ** self.gamma) * ce).mean()
+
+
 
 # ─── Early Stopper ────────────────────────────────────────────────────────────
 
@@ -152,7 +164,8 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
     oof_logits  = torch.zeros(n_nodes, 2)
     test_logits = torch.zeros(n_nodes, 2)
 
-    loss_fn = nn.CrossEntropyLoss()
+    # loss_fn = nn.CrossEntropyLoss()
+    loss_fn = FocalLoss(gamma=2.0, alpha=0.25)
     best_models = []
     n_fold = args["n_fold"]
 
