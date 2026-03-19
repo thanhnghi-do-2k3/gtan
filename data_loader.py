@@ -197,11 +197,14 @@ def load_sffsd(data_dir: str, test_size: float = 0.4):
     edge_index = _sffsd_edge_index(data)
     edge_index = _add_self_loops(edge_index, len(data))
 
-    idx = list(range(len(labels)))
-    train_idx, test_idx = train_test_split(
-        idx, stratify=labels, test_size=test_size / 2,
-        random_state=2, shuffle=True
-    )
+    # Paper: chia theo thời gian — 80% đầu làm train, 20% cuối làm test
+    # (S-FFSD đã được sắp xếp theo thời gian trong CSV)
+    n = len(data)
+    cutoff = int(n * 0.8)
+    train_idx = list(range(0, cutoff))
+    test_idx  = list(range(cutoff, n))
+    print(f"  S-FFSD time split: train={len(train_idx):,} / test={len(test_idx):,}")
+
     return feat_df, labels, train_idx, test_idx, edge_index, cat_features
 
 

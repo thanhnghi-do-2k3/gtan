@@ -1,12 +1,3 @@
-"""
-GTAN Training Loop (PyG version)
-- Mini-batch neighbor sampling với torch_geometric NeighborLoader
-- K-fold cross validation
-- Early stopping
-- Masked label leakage prevention
-- Evaluation: AUC, F1-macro, AP
-"""
-
 import os
 import copy
 import numpy as np
@@ -15,7 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import MultiStepLR
 from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.data import Data
 
@@ -80,18 +71,20 @@ def run_epoch(model, loader, optimizer, loss_fn, device,
             batch = batch.to(device)
             # batch.n_id: node IDs trong graph gốc
             n_ids = batch.n_id  # [num_nodes_in_subgraph,]
-            n_ids = n_ids.cpu()
             batch_size = batch.batch_size  # số center nodes
 
             # Categorical features cho subgraph nodes
+            # n_ids phải ở CPU khi index tensor CPU
+            n_ids_cpu = n_ids.cpu()
             cat_batch = {
-                col: t[n_ids].to(device)
+                col: t[n_ids_cpu].to(device)
                 for col, t in cat_feat_tensors.items()
             } if cat_feat_tensors else None
 
             # Masked labels: center nodes ([:batch_size]) → 2 (padding)
             # Neighbor nodes giữ nguyên label để propagate risk info
-            lpa_labels = labels_tensor[n_ids].clone().to(device)
+            # n_ids có thể đang trên GPU — move về CPU trước khi index labels_tensor
+            lpa_labels = labels_tensor[n_ids_cpu].clone().to(device)
             lpa_labels[:batch_size] = 2   # mask center nodes
 
             logits = model(batch.x, batch.edge_index, lpa_labels, cat_batch)
@@ -123,7 +116,7 @@ def run_epoch(model, loader, optimizer, loss_fn, device,
 
             # Lưu OOF / test predictions
             if oof_logits is not None:
-                center_ids = n_ids[:batch_size]
+                center_ids = n_ids_cpu[:batch_size]
                 oof_logits[center_ids] = center_logits.detach().cpu()
 
     avg_loss = total_loss / max(total_count, 1)
@@ -160,17 +153,34 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
     test_logits = torch.zeros(n_nodes, 2)
 
     loss_fn = nn.CrossEntropyLoss()
-    kfold   = StratifiedKFold(n_splits=args["n_fold"], shuffle=True, random_state=args["seed"])
-    y_train_arr = labels.iloc[train_idx].values
     best_models = []
+    n_fold = args["n_fold"]
 
-    for fold, (trn_rel, val_rel) in enumerate(kfold.split(
-            np.array(train_idx), y_train_arr)):
-        trn_idx_fold = np.array(train_idx)[trn_rel].tolist()
-        val_idx_fold = np.array(train_idx)[val_rel].tolist()
+    # ─── Tạo danh sách (trn_idx, val_idx) theo fold ───────────────────────────
+    if n_fold >= 2:
+        # K-Fold mode
+        kfold = StratifiedKFold(n_splits=n_fold, shuffle=True, random_state=args["seed"])
+        y_train_arr = labels.iloc[train_idx].values
+        fold_splits = [
+            (np.array(train_idx)[trn_rel].tolist(),
+             np.array(train_idx)[val_rel].tolist())
+            for trn_rel, val_rel in kfold.split(np.array(train_idx), y_train_arr)
+        ]
+    else:
+        # Fixed split mode (như paper): chia train → 80% trn / 20% val
+        y_train_arr = labels.iloc[train_idx].values
+        trn_rel, val_rel = train_test_split(
+            np.array(train_idx),
+            test_size=0.2,
+            stratify=y_train_arr,
+            random_state=args["seed"],
+        )
+        fold_splits = [(trn_rel.tolist(), val_rel.tolist())]
 
+    for fold, (trn_idx_fold, val_idx_fold) in enumerate(fold_splits):
+        fold_label = f"Fold {fold+1}/{len(fold_splits)}" if n_fold >= 2 else "Fixed Split"
         print(f"\n{'='*60}")
-        print(f"  Fold {fold+1}/{args['n_fold']}  "
+        print(f"  {fold_label}  "
               f"train={len(trn_idx_fold)} val={len(val_idx_fold)}")
         print(f"{'='*60}")
 
