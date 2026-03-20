@@ -10,22 +10,31 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.data import Data
 
+
 from gtan_model import GraphAttnModel
 
+
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=0.25):
+    def __init__(self, gamma=2.0, alpha=0.25, class_weight=1.0):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
+        self.class_weight = class_weight
 
     def forward(self, logits, targets):
-        ce = nn.functional.cross_entropy(logits, targets, reduction='none')
+        weight = torch.tensor([1.0, self.class_weight], dtype=torch.float32).to(logits.device)
+        ce = nn.functional.cross_entropy(logits, targets, weight=weight, reduction='none')
         pt = torch.exp(-ce)
-        return ((self.alpha * (1 - pt) ** self.gamma) * ce).mean()
-
+        alpha_t = torch.where(
+            targets == 1,
+            torch.tensor(self.alpha, dtype=torch.float32).to(logits.device),
+            torch.tensor(1 - self.alpha, dtype=torch.float32).to(logits.device)
+        )
+        return (alpha_t * (1 - pt) ** self.gamma * ce).mean()
 
 
 # ─── Early Stopper ────────────────────────────────────────────────────────────
+
 
 class EarlyStopper:
     def __init__(self, patience: int = 10):
@@ -50,6 +59,7 @@ class EarlyStopper:
 
 # ─── Build PyG Data object ────────────────────────────────────────────────────
 
+
 def build_pyg_data(feat_df, edge_index, labels_tensor, device) -> Data:
     x = torch.tensor(feat_df.values, dtype=torch.float32)
     data = Data(
@@ -63,14 +73,11 @@ def build_pyg_data(feat_df, edge_index, labels_tensor, device) -> Data:
 
 # ─── Core train/eval loop ─────────────────────────────────────────────────────
 
+
 def run_epoch(model, loader, optimizer, loss_fn, device,
               cat_feat_tensors, labels_tensor,
               mode: str = "train",
               oof_logits: torch.Tensor = None):
-    """
-    mode = 'train' | 'eval'
-    Trả về (avg_loss, all_preds_proba, all_true_labels)
-    """
     is_train = (mode == "train")
     model.train() if is_train else model.eval()
 
@@ -81,30 +88,22 @@ def run_epoch(model, loader, optimizer, loss_fn, device,
     with ctx:
         for batch in loader:
             batch = batch.to(device)
-            # batch.n_id: node IDs trong graph gốc
-            n_ids = batch.n_id  # [num_nodes_in_subgraph,]
-            batch_size = batch.batch_size  # số center nodes
+            n_ids = batch.n_id
+            batch_size = batch.batch_size
 
-            # Categorical features cho subgraph nodes
-            # n_ids phải ở CPU khi index tensor CPU
             n_ids_cpu = n_ids.cpu()
             cat_batch = {
                 col: t[n_ids_cpu].to(device)
                 for col, t in cat_feat_tensors.items()
             } if cat_feat_tensors else None
 
-            # Masked labels: center nodes ([:batch_size]) → 2 (padding)
-            # Neighbor nodes giữ nguyên label để propagate risk info
-            # n_ids có thể đang trên GPU — move về CPU trước khi index labels_tensor
             lpa_labels = labels_tensor[n_ids_cpu].clone().to(device)
-            lpa_labels[:batch_size] = 2   # mask center nodes
+            lpa_labels[:batch_size] = 2
 
             logits = model(batch.x, batch.edge_index, lpa_labels, cat_batch)
-            # Chỉ tính loss trên center nodes
             center_logits = logits[:batch_size]
             center_labels = batch.y[:batch_size].to(device)
 
-            # Bỏ unlabeled nodes (label==2) khỏi loss
             valid_mask = center_labels != 2
             cl_v = center_logits[valid_mask]
             lb_v = center_labels[valid_mask]
@@ -117,6 +116,7 @@ def run_epoch(model, loader, optimizer, loss_fn, device,
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             total_loss  += loss.item() * lb_v.numel()
@@ -126,7 +126,6 @@ def run_epoch(model, loader, optimizer, loss_fn, device,
             all_proba.extend(proba.tolist())
             all_true.extend(lb_v.cpu().numpy().tolist())
 
-            # Lưu OOF / test predictions
             if oof_logits is not None:
                 center_ids = n_ids_cpu[:batch_size]
                 oof_logits[center_ids] = center_logits.detach().cpu()
@@ -136,6 +135,7 @@ def run_epoch(model, loader, optimizer, loss_fn, device,
 
 
 # ─── Main training function ──────────────────────────────────────────────────
+
 
 def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_features):
     device_str = args.get("device", "cpu")
@@ -159,19 +159,29 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
     # PyG Data object
     data = build_pyg_data(feat_df, edge_index, labels_tensor, device)
 
-    # OOF và test predictions (lưu trên CPU để tiết kiệm VRAM)
+    # OOF và test predictions
     n_nodes = len(feat_df)
     oof_logits  = torch.zeros(n_nodes, 2)
     test_logits = torch.zeros(n_nodes, 2)
 
-    # loss_fn = nn.CrossEntropyLoss()
-    loss_fn = FocalLoss(gamma=2.0, alpha=0.25)
+    # ── Tính class weight từ train set ──────────────────────────────────────
+    train_labels = labels.iloc[train_idx].values
+    # Chỉ tính trên labeled nodes (loại unlabeled=2)
+    labeled_mask = train_labels != 2
+    labeled_train = train_labels[labeled_mask]
+    n_legit = (labeled_train == 0).sum()
+    n_fraud = (labeled_train == 1).sum()
+    fraud_weight = float(min(n_legit / n_fraud, 30.0))
+    print(f"  Class weight → legit=1.0 | fraud={fraud_weight:.2f}x  "
+          f"(n_legit={n_legit}, n_fraud={n_fraud})")
+
+    loss_fn = FocalLoss(gamma=2.0, alpha=0.25, class_weight=fraud_weight)
+
     best_models = []
     n_fold = args["n_fold"]
 
-    # ─── Tạo danh sách (trn_idx, val_idx) theo fold ───────────────────────────
+    # ─── Tạo danh sách fold splits ───────────────────────────────────────────
     if n_fold >= 2:
-        # K-Fold mode
         kfold = StratifiedKFold(n_splits=n_fold, shuffle=True, random_state=args["seed"])
         y_train_arr = labels.iloc[train_idx].values
         fold_splits = [
@@ -180,7 +190,6 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
             for trn_rel, val_rel in kfold.split(np.array(train_idx), y_train_arr)
         ]
     else:
-        # Fixed split mode (như paper): chia train → 80% trn / 20% val
         y_train_arr = labels.iloc[train_idx].values
         trn_rel, val_rel = train_test_split(
             np.array(train_idx),
@@ -197,8 +206,7 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
               f"train={len(trn_idx_fold)} val={len(val_idx_fold)}")
         print(f"{'='*60}")
 
-        # NeighborLoader: sample num_neighbors neighbors mỗi hop
-        num_neighbors = [10] * args["n_layers"]  # 10 neighbors per hop
+        num_neighbors = [10] * args["n_layers"]
         train_loader = NeighborLoader(
             data,
             num_neighbors=num_neighbors,
@@ -216,10 +224,9 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
             num_workers=0,
         )
 
-        # Model
         model = GraphAttnModel(
             in_feats   = feat_df.shape[1],
-            hidden_dim = args["hid_dim"] // 4,   # 256//4=64, ×4heads=256
+            hidden_dim = args["hid_dim"] // 4,
             n_layers   = args["n_layers"],
             n_classes  = 2,
             heads      = [4] * args["n_layers"],
@@ -232,7 +239,6 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
             n2v_feat   = bool(cat_features),
         ).to(device)
 
-        # LR scale theo batch size (theo paper)
         lr = args["lr"] * np.sqrt(args["batch_size"] / 1024)
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args["wd"])
         scheduler = MultiStepLR(optimizer, milestones=[4000, 12000], gamma=0.3)
@@ -251,7 +257,6 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
                 oof_logits=oof_logits,
             )
 
-            # Print metrics
             try:
                 tr_auc = roc_auc_score(tr_true, tr_prob) if len(np.unique(tr_true)) > 1 else 0.0
                 vl_auc = roc_auc_score(vl_true, vl_prob) if len(np.unique(vl_true)) > 1 else 0.0
@@ -268,7 +273,6 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
         print(f"  Best val loss: {stopper.best_loss:.7f}")
         best_models.append(stopper.best_model)
 
-        # Inference test set với best model
         test_loader = NeighborLoader(
             data,
             num_neighbors=num_neighbors,
@@ -282,9 +286,8 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
             device, cat_feat_tensors, labels_tensor, mode="eval",
             oof_logits=test_logits,
         )
-        # Ensemble: average across folds
         if fold > 0:
-            test_logits /= 2  # running average (simplified)
+            test_logits /= 2
 
     # ─── Final Evaluation ─────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -296,7 +299,6 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
     ts_proba  = torch.softmax(test_logits, dim=1)[test_arr, 1].numpy()
     ts_pred   = torch.argmax(test_logits, dim=1)[test_arr].numpy()
 
-    # Filter unlabeled
     valid = y_test != 2
     y_test   = y_test[valid]
     ts_proba = ts_proba[valid]
@@ -306,12 +308,11 @@ def gtan_train(feat_df, edge_index, train_idx, test_idx, labels, args, cat_featu
     f1  = f1_score(y_test, ts_pred, average="macro")
     ap  = average_precision_score(y_test, ts_proba)
 
-    print(f"\n  AUC      = {auc:.4f}   (paper: YelpChi 0.924 | Amazon 0.963)")
-    print(f"  F1-macro = {f1:.4f}   (paper: YelpChi 0.799 | Amazon 0.921)")
-    print(f"  AP       = {ap:.4f}   (paper: YelpChi 0.751 | Amazon 0.884)")
+    print(f"\n  AUC      = {auc:.4f}")
+    print(f"  F1-macro = {f1:.4f}")
+    print(f"  AP       = {ap:.4f}")
     print(f"{'='*60}\n")
 
-    # Save checkpoint
     ckpt_dir = args.get("checkpoint_dir", "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(ckpt_dir, f"gtan_{args.get('dataset','model')}_best.pt")
